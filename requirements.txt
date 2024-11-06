@@ -1,0 +1,4 @@
+discord.py==1.7.3         # For bot functionality
+requests==2.26.0          # For making HTTP requests to betting APIs
+pandas==1.3.3             # For data handling and analysis
+APScheduler==3.8.1        # For scheduling periodic checks

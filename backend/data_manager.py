@@ -1,22 +1,37 @@
-# backend/data_manager.py
-
-import sqlite3
 from datetime import datetime, timezone, timedelta
 from backend.odds_fetcher import fetch_odds_from_api
-from backend.db_manager import connect_db
+from backend.db_connection import connect_db
 
-def delete_expired_opportunities():
-    conn = connect_db()
-    cursor = conn.cursor()
+async def get_current_odds_for_event(event_name):
+    odds_data = await fetch_odds_from_api()
+    if not odds_data:
+        return None
+
+    for event in odds_data:
+        current_event_name = f"{event['home_team']} vs. {event['away_team']}"
+        if current_event_name == event_name:
+            odds = {}
+            for bookmaker in event['bookmakers']:
+                platform = bookmaker['title']
+                for market in bookmaker['markets']:
+                    if market['key'] == 'h2h':
+                        for outcome in market['outcomes']:
+                            odds[platform] = float(outcome['price'])
+            return odds
+    return None
+
+async def delete_expired_opportunities():
+    conn = await connect_db()
+    cursor = await conn.cursor()
 
     # Get current time in UTC
     current_time = datetime.now(timezone.utc)
 
     # Select opportunities that have commenced
-    cursor.execute('''
+    await cursor.execute('''
         SELECT id, commence_time FROM arbitrage_opportunities WHERE is_active = 1
     ''')
-    rows = cursor.fetchall()
+    rows = await cursor.fetchall()
 
     expired_ids = []
     for row in rows:
@@ -37,32 +52,32 @@ def delete_expired_opportunities():
 
     # Mark expired opportunities as inactive
     if expired_ids:
-        cursor.execute(f'''
+        await cursor.execute(f'''
             UPDATE arbitrage_opportunities SET is_active = 0 WHERE id IN ({','.join('?' for _ in expired_ids)})
         ''', expired_ids)
         print(f"Marked {len(expired_ids)} expired opportunities as inactive.")
     else:
         print("No expired opportunities to mark as inactive.")
 
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
 
-def delete_invalid_opportunities():
-    conn = connect_db()
-    cursor = conn.cursor()
+async def delete_invalid_opportunities():
+    conn = await connect_db()
+    cursor = await conn.cursor()
 
     # Get all active opportunities
-    cursor.execute('''
+    await cursor.execute('''
         SELECT id, event_name, platform_a, odds_a, platform_b, odds_b FROM arbitrage_opportunities WHERE is_active = 1
     ''')
-    opportunities = cursor.fetchall()
+    opportunities = await cursor.fetchall()
 
     invalid_ids = []
     for opp in opportunities:
         opp_id, event_name, platform_a, odds_a, platform_b, odds_b = opp
 
         # Fetch current odds for the event
-        current_odds = get_current_odds_for_event(event_name)
+        current_odds = await get_current_odds_for_event(event_name)
         if not current_odds:
             continue  # Event might have ended or no longer available
 
@@ -83,63 +98,71 @@ def delete_invalid_opportunities():
 
     # Mark invalid opportunities as inactive
     if invalid_ids:
-        cursor.execute(f'''
+        await cursor.execute(f'''
             UPDATE arbitrage_opportunities SET is_active = 0 WHERE id IN ({','.join('?' for _ in invalid_ids)})
         ''', invalid_ids)
         print(f"Marked {len(invalid_ids)} invalid opportunities as inactive.")
     else:
         print("No invalid opportunities due to odds changes.")
 
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
 
-def delete_old_opportunities():
-    conn = connect_db()
-    cursor = conn.cursor()
+async def delete_old_opportunities():
+    conn = await connect_db()
+    cursor = await conn.cursor()
 
-    # Set time threshold (e.g., 5 minutes ago)
-    time_threshold = datetime.now(timezone.utc) - timedelta(minutes=5)
+    # Set time threshold (e.g., 1 day ago)
+    time_threshold = datetime.now(timezone.utc) - timedelta(days=1)
 
-    # Mark opportunities older than threshold as inactive
-    cursor.execute('''
-        UPDATE arbitrage_opportunities
-        SET is_active = 0
-        WHERE is_active = 1 AND datetime(timestamp) <= datetime(?)
+    # Delete opportunities older than threshold
+    await cursor.execute('''
+        DELETE FROM arbitrage_opportunities
+        WHERE datetime(timestamp) <= datetime(?)
     ''', (time_threshold.isoformat(),))
 
     affected_rows = cursor.rowcount
-    print(f"Marked {affected_rows} old opportunities as inactive.")
+    print(f"Deleted {affected_rows} old opportunities.")
 
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
 
-def get_current_odds_for_event(event_name):
-    odds_data = fetch_odds_from_api()
-    if not odds_data:
-        return None
+    async def insert_bet(event_name, platform, odds, stake, potential_profit, status, user_id):
+        try:
+            conn = await connect_db()
+            cursor = await conn.cursor()
+            await cursor.execute('''
+                INSERT INTO bets (event_name, platform, odds, stake, potential_profit, status, user_id, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (event_name, platform, odds, stake, potential_profit, status, user_id, datetime.utcnow()))
+            await conn.commit()
+            await cursor.close()
+            await conn.close()
+        except Exception as e:
+            print(f"Exception in insert_bet: {e}")
 
-    for event in odds_data:
-        current_event_name = f"{event['home_team']} vs. {event['away_team']}"
-        if current_event_name == event_name:
-            odds = {}
-            for bookmaker in event['bookmakers']:
-                platform = bookmaker['title']
-                for market in bookmaker['markets']:
-                    if market['key'] == 'h2h':
-                        for outcome in market['outcomes']:
-                            odds[platform] = float(outcome['price'])
-            return odds
-    return None
+async def update_bet_status(bet_id, status):
+    try:
+        conn = await connect_db()
+        cursor = await conn.cursor()
+        await cursor.execute('''
+            UPDATE bets SET status = ? WHERE id = ?
+        ''', (status, bet_id))
+        await conn.commit()
+        await cursor.close()
+        await conn.close()
+    except Exception as e:
+        print(f"Exception in update_bet_status: {e}")
 
-def delete_opportunities_with_null_commence_time():
-    conn = connect_db()
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        DELETE FROM arbitrage_opportunities WHERE commence_time IS NULL
-    ''')
-    deleted_count = cursor.rowcount
-    print(f"Deleted {deleted_count} opportunities with NULL commence_time.")
-
-    conn.commit()
-    conn.close()
+async def update_trade_taken(trade_id, trade_taken):
+    try:
+        conn = await connect_db()
+        cursor = await conn.cursor()
+        await cursor.execute('''
+            UPDATE arbitrage_opportunities SET trade_taken = ? WHERE id = ?
+        ''', (trade_taken, trade_id))
+        await conn.commit()
+        await cursor.close()
+        await conn.close()
+    except Exception as e:
+        print(f"Exception in update_trade_taken: {e}")
